@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
+from zipfile import BadZipFile
 
 
 Sku = tuple[tuple[str, str], ...]
@@ -44,6 +45,7 @@ _COLUMNS = tuple(side + name for side in ('自家', '对手') for name in _FIELD
     '差价', '状态', '原因', '未配对店名', '未配对标题', '未配对商品ID',
 )
 _INVENTORY_COLUMNS = ('店铺名', '商品名称', '关键名称', '券前价', '状态', '原因')
+_REPORT_COLUMNS = {'规格明细': _INVENTORY_COLUMNS, '差价': _COLUMNS}
 _SCAN_COMPARISON_COLUMNS = (
     '关键名称', '自家店铺', '自家券前价', '竞品店铺', '竞品券前价', '差价', '自家筒数', '竞品筒数', '状态',
 )
@@ -139,7 +141,7 @@ def read_pairs(path: Path) -> list[Pair]:
 
 
 @contextmanager
-def _atomic_output(path: Path, mode: str, encoding: str | None = None):
+def _atomic_output(path: Path, mode: str, encoding: str | None = None, *, overwrite: bool = True):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = tempfile.NamedTemporaryFile(
         mode=mode, encoding=encoding, dir=path.parent, delete=False,
@@ -150,7 +152,10 @@ def _atomic_output(path: Path, mode: str, encoding: str | None = None):
             yield temporary
             temporary.flush()
             os.fsync(temporary.fileno())
-        temporary_path.replace(path)
+        if overwrite:
+            temporary_path.replace(path)
+        else:
+            os.link(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -351,6 +356,21 @@ def write_comparison_xlsx(path: Path, rows: list[dict[str, str]]) -> None:
     _write_xlsx(path, [('差价', _COLUMNS, rows, {'自家券前价', '对手券前价', '差价'})])
 
 
+def is_price_report(path: Path) -> bool:
+    from openpyxl import load_workbook
+
+    try:
+        workbook = load_workbook(path, read_only=True)
+        try:
+            sheet = workbook.worksheets[0]
+            columns = _REPORT_COLUMNS.get(sheet.title)
+            return columns is not None and next(sheet.values, ()) == columns
+        finally:
+            workbook.close()
+    except (BadZipFile, IndexError, KeyError, OSError, SyntaxError, ValueError):
+        return False
+
+
 def _tube_count(title: str, spec: Sku) -> int | None:
     for text in (' '.join(value for _, value in spec), title):
         counts = {
@@ -428,7 +448,7 @@ def _write_xlsx(path: Path, sheets: list[tuple[str, tuple[str, ...], list[dict[s
     for index, (sheet_name, columns, rows, numeric_fields) in enumerate(sheets):
         sheet = workbook.active if index == 0 else workbook.create_sheet()
         _fill_sheet(sheet, sheet_name, columns, rows, numeric_fields)
-    with _atomic_output(path, 'w+b') as output:
+    with _atomic_output(path, 'w+b', overwrite=False) as output:
         workbook.save(output)
 
 

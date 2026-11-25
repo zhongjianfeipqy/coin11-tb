@@ -5,6 +5,7 @@ from datetime import datetime
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Callable, TypeVar
 
@@ -13,6 +14,7 @@ from pdd_compare import (
     Pair,
     Product,
     comparison_rows,
+    is_price_report,
     read_pairs,
     save_pairs,
     shop_role,
@@ -24,6 +26,34 @@ from pdd_compare import (
 
 Item = TypeVar("Item")
 log = logging.getLogger("拼多多采集")
+_REPORT_NAME = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2})(?:-([0-9]{6})| \(([0-9]+)\))?\.xlsx"
+)
+
+
+def _export_report(path: Path, write: Callable[[Path], Item]) -> tuple[Path, Item]:
+    output = path
+    version = 1
+    while True:
+        try:
+            result = write(output)
+            break
+        except FileExistsError as error:
+            if error.filename2 != str(output):
+                raise
+            version += 1
+            output = path.with_name(f"{path.stem} ({version}).xlsx")
+
+    reports = []
+    for candidate in path.parent.glob("*.xlsx"):
+        match = _REPORT_NAME.fullmatch(candidate.name)
+        if match and not candidate.is_symlink() and candidate.is_file() and is_price_report(candidate):
+            stamp, micros, suffix = match.groups()
+            reports.append(((stamp, micros is None, int(micros or suffix or 0)), candidate))
+    for _, old_report in sorted(reports, reverse=True)[3:]:
+        old_report.unlink(missing_ok=True)
+        log.info("清理旧比价报表：%s", old_report)
+    return output, result
 
 
 def _choose(prompt: str, items: list[Item], label: Callable[[Item], str]) -> Item | None:
@@ -174,7 +204,7 @@ def _compare(device, pairs: list[Pair], output: Path) -> int:
     products, complete = _collect(device, collect_ids)
     rows = comparison_rows(products, pairs, scan_complete=complete)
     log.info("写入差价 Excel：%s，共 %d 行", output, len(rows))
-    write_comparison_xlsx(output, rows)
+    output, _ = _export_report(output, lambda path: write_comparison_xlsx(path, rows))
     print(f"已导出 {len(rows)} 行 · {output}")
     if not pairs:
         print("还没有配对。使用 pair 命令确认自家商品与对手商品。")
@@ -215,13 +245,13 @@ def main(argv: list[str] | None = None) -> int:
             _pair_products(device, pair_file, read_pairs(pair_file))
             return 0
 
-        stamp = started_at.strftime("%Y-%m-%d_%H-%M-%S-%f")
+        stamp = started_at.strftime("%Y-%m-%d_%H-%M-%S")
         output = args.output_dir.expanduser() / f"{stamp}.xlsx"
         log.info("本次结果文件=%s", output)
         if args.command == "scan":
             products, complete = _collect(device, None, args.limit)
             log.info("写入规格明细 Excel：已读取 %d 件商品，本轮正常结束=%s", len(products), complete)
-            count = write_inventory_xlsx(output, products)
+            output, count = _export_report(output, lambda path: write_inventory_xlsx(path, products))
             print(f"已导出 {count} 行 · {output}")
             return 0 if complete else 1
         return _compare(device, read_pairs(pair_file), output)
